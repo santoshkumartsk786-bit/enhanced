@@ -370,22 +370,18 @@ def main():
                 st.session_state.example_query = ex
     
     # Main interface
-    # Main interface
-st.header("🔍 Ask About Movie Reviews")
-
-# Get the example query if it exists
-default_query = st.session_state.get('example_query', '')
-
-query = st.text_input(
-    "Enter your question:",
-    value=default_query,
-    placeholder="e.g., Why do some movies receive negative sentiment?",
-    label_visibility="collapsed"
-)
-
-# Clear the example_query after it's been used
-if default_query:
-    st.session_state.example_query = ''
+    st.header("🔍 Ask About Movie Reviews")
+    
+    default_query = st.session_state.get('example_query', '')
+    if 'example_query' in st.session_state:
+        del st.session_state.example_query
+    
+    query = st.text_input(
+        "Enter your question:",
+        value=default_query,
+        placeholder="e.g., Why do some movies receive negative sentiment?",
+        label_visibility="collapsed"
+    )
     
     col1, col2 = st.columns([1, 5])
     with col1:
@@ -560,6 +556,4 @@ if default_query:
     st.caption("Sentiment detection: Keyword-based analysis + existing labels")
 
 if __name__ == "__main__":
-
     main()
-
