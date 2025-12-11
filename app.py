@@ -104,17 +104,17 @@ def load_all_resources():
         device = "cuda" if torch.cuda.is_available() else "cpu"
         generator = generator.to(device)
         
-        # Load FAISS index
-        if not os.path.exists("models/faiss_index (1).bin"):
+        # Load FAISS index - FIXED PATH
+        if not os.path.exists("models/faiss_index.bin"):
             return None, None, None, None, None, None, "faiss_missing"
         
-        index = faiss.read_index("models/faiss_index (1).bin")
+        index = faiss.read_index("models/faiss_index.bin")
         
-        # Load metadata
-        if not os.path.exists("models/review_metadata (2).pkl"):
+        # Load metadata - FIXED PATH
+        if not os.path.exists("models/review_metadata.pkl"):
             return None, None, None, None, None, None, "metadata_missing"
         
-        with open('models/review_metadata (2).pkl', 'rb') as f:
+        with open('models/review_metadata.pkl', 'rb') as f:
             metadata = pickle.load(f)
         
         # Load build report if exists
@@ -268,7 +268,7 @@ def main():
                 2. Commit `models/faiss_index.bin` to GitHub
                 3. Redeploy on Streamlit Cloud
                 
-                **Note:** Make sure you have `data/imdb_reviews.csv` with your reviews before building the index.
+                **Note:** Make sure you have `data/imdb_sup.csv` with your reviews before building the index.
                 """)
             elif error_or_report == "metadata_missing":
                 st.error("""
