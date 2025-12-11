@@ -108,10 +108,10 @@ def load_all_resources():
         if not os.path.exists("models/faiss_index.bin"):
             return None, None, None, None, None, None, "faiss_missing"
         
-        index = faiss.read_index("models/faiss_index.bin")
+        index = faiss.read_index("models/faiss_index (1).bin")
         
         # Load metadata - FIXED PATH
-        if not os.path.exists("models/review_metadata.pkl"):
+        if not os.path.exists("models/review_metadata (2).pkl"):
             return None, None, None, None, None, None, "metadata_missing"
         
         with open('models/review_metadata.pkl', 'rb') as f:
@@ -557,3 +557,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
