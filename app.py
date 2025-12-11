@@ -105,7 +105,7 @@ def load_all_resources():
         generator = generator.to(device)
         
         # Load FAISS index - FIXED PATH
-        if not os.path.exists("models/faiss_index.bin"):
+        if not os.path.exists("models/faiss_index (1).bin"):
             return None, None, None, None, None, None, "faiss_missing"
         
         index = faiss.read_index("models/faiss_index (1).bin")
@@ -557,4 +557,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
