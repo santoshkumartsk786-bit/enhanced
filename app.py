@@ -1,561 +1,444 @@
-"""
-RAG-based Movie Sentiment Analysis with Evidence Retrieval
-Streamlit Application - Works with Auto-Detected Sentiment
-Production Ready - No API Keys Required
-"""
+# ============================================================================
+# COMPLETE RAG SYSTEM - STREAMLIT APP
+# Save as: app.py
+# ============================================================================
 
 import streamlit as st
-import pandas as pd
-import numpy as np
 import pickle
-import faiss
-from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-import torch
-import plotly.graph_objects as go
-from datetime import datetime
 import json
-import os
+import numpy as np
+import re
+from sentence_transformers import SentenceTransformer
+import faiss
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import plotly.graph_objects as go
 
-# ============================================================================
-# PAGE CONFIGURATION
-# ============================================================================
+# Download NLTK data
+@st.cache_resource
+def download_nltk_data():
+    try:
+        nltk.data.find('corpora/stopwords')
+        nltk.data.find('corpora/wordnet')
+    except LookupError:
+        nltk.download('stopwords', quiet=True)
+        nltk.download('wordnet', quiet=True)
+        nltk.download('omw-1.4', quiet=True)
+
+download_nltk_data()
 
 st.set_page_config(
-    page_title="Movie Sentiment RAG System",
+    page_title="RAG Movie Review Analyzer",
     page_icon="🎬",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
 # Custom CSS
 st.markdown("""
-<style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #1f77b4;
-        text-align: center;
-        padding: 1rem 0;
+    <style>
+    .positive-box {
+        background-color: #d4edda;
+        border-left: 5px solid #28a745;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin: 1rem 0;
+    }
+    .negative-box {
+        background-color: #f8d7da;
+        border-left: 5px solid #dc3545;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin: 1rem 0;
+    }
+    .retrieved-review {
+        background-color: #f8f9fa;
+        padding: 1rem;
+        margin: 0.5rem 0;
+        border-radius: 0.5rem;
+        border-left: 3px solid #007bff;
     }
     .answer-box {
-        background-color: #f0f7ff;
-        padding: 1.5rem;
-        border-radius: 10px;
-        border-left: 5px solid #1f77b4;
-        margin: 1rem 0;
-    }
-    .source-box {
-        background-color: #ffffff;
-        padding: 1rem;
-        border-radius: 8px;
-        border: 1px solid #e0e0e0;
-        margin: 0.5rem 0;
-    }
-    .positive-badge {
-        background-color: #d4edda;
-        color: #155724;
-        padding: 0.3rem 0.8rem;
-        border-radius: 15px;
-        font-weight: bold;
-        display: inline-block;
-    }
-    .negative-badge {
-        background-color: #f8d7da;
-        color: #721c24;
-        padding: 0.3rem 0.8rem;
-        border-radius: 15px;
-        font-weight: bold;
-        display: inline-block;
-    }
-    .neutral-badge {
-        background-color: #fff3cd;
-        color: #856404;
-        padding: 0.3rem 0.8rem;
-        border-radius: 15px;
-        font-weight: bold;
-        display: inline-block;
-    }
-    .info-box {
         background-color: #e7f3ff;
-        padding: 1rem;
-        border-radius: 8px;
-        border-left: 4px solid #2196F3;
+        border-left: 5px solid #007bff;
+        padding: 1.5rem;
+        border-radius: 0.5rem;
         margin: 1rem 0;
     }
-</style>
+    </style>
 """, unsafe_allow_html=True)
 
 # ============================================================================
-# LOAD MODELS AND DATA
+# CLASSES
 # ============================================================================
 
-@st.cache_resource(show_spinner=False)
-def load_all_resources():
-    """Load encoder, generator, FAISS index, and metadata"""
+class TextPreprocessor:
+    def __init__(self):
+        self.lemmatizer = WordNetLemmatizer()
+        self.stop_words = set(stopwords.words('english'))
+        self.stop_words -= {'not', 'no', 'nor', 'neither', 'never'}
+        
+    def clean_text(self, text):
+        if not isinstance(text, str):
+            return ""
+        text = text.lower()
+        text = re.sub(r'http\S+|www\S+|https\S+', '', text)
+        text = re.sub(r'<.*?>', '', text)
+        text = re.sub(r'[^a-zA-Z\s!?.,]', '', text)
+        return ' '.join(text.split())
     
+    def lemmatize_text(self, text):
+        words = text.split()
+        words = [self.lemmatizer.lemmatize(word) for word in words 
+                if word not in self.stop_words or word in ['not', 'no', 'never']]
+        return ' '.join(words)
+    
+    def preprocess(self, text):
+        text = self.clean_text(text)
+        text = self.lemmatize_text(text)
+        return text
+
+# ============================================================================
+# RAG SYSTEM
+# ============================================================================
+
+class RAGSystem:
+    """Complete RAG system with retrieval and generation"""
+    
+    def __init__(self, index, review_db, classifier_data, encoder):
+        self.index = index
+        self.reviews = review_db['reviews']
+        self.sentiments = review_db['sentiments']
+        self.ratings = review_db['ratings']
+        self.encoder = encoder
+        
+        # Classifier components
+        self.classifier = classifier_data['model']
+        self.tfidf = classifier_data['tfidf']
+        self.label_encoder = classifier_data['label_encoder']
+        
+        self.preprocessor = TextPreprocessor()
+        self.vader = SentimentIntensityAnalyzer()
+    
+    def retrieve(self, query, top_k=5):
+        """Retrieve relevant reviews for a query"""
+        # Encode query
+        query_embedding = self.encoder.encode([query], convert_to_numpy=True)
+        
+        # Search in FAISS
+        distances, indices = self.index.search(query_embedding.astype('float32'), top_k)
+        
+        # Get retrieved reviews
+        retrieved = []
+        for idx, dist in zip(indices[0], distances[0]):
+            retrieved.append({
+                'review': self.reviews[idx],
+                'sentiment': self.sentiments[idx],
+                'rating': self.ratings[idx] if self.ratings[idx] else 'N/A',
+                'distance': float(dist),
+                'relevance': 1 / (1 + dist)  # Convert distance to relevance score
+            })
+        
+        return retrieved
+    
+    def generate_answer(self, query, retrieved_reviews):
+        """Generate answer based on retrieved reviews"""
+        
+        # Count sentiments
+        pos_count = sum(1 for r in retrieved_reviews if r['sentiment'] == 'positive')
+        neg_count = len(retrieved_reviews) - pos_count
+        
+        # Calculate overall sentiment
+        if pos_count > neg_count:
+            overall = "positive"
+            confidence = pos_count / len(retrieved_reviews)
+        else:
+            overall = "negative"
+            confidence = neg_count / len(retrieved_reviews)
+        
+        # Extract key themes
+        all_text = ' '.join([r['review'] for r in retrieved_reviews[:3]])
+        
+        # Generate natural language answer
+        answer = f"Based on {len(retrieved_reviews)} relevant reviews, the overall sentiment is **{overall}** "
+        answer += f"({pos_count} positive, {neg_count} negative). "
+        
+        # Add specific insights
+        if pos_count > 0:
+            pos_reviews = [r for r in retrieved_reviews if r['sentiment'] == 'positive']
+            answer += f"\n\n**Positive aspects mentioned:** Viewers appreciated "
+            # Extract positive keywords
+            pos_words = []
+            for review in pos_reviews[:2]:
+                words = review['review'].lower().split()
+                pos_words.extend([w for w in words if w in ['great', 'amazing', 'excellent', 'love', 'perfect', 'fantastic']])
+            if pos_words:
+                unique_words = list(set(pos_words))[:3]
+                answer += ', '.join(unique_words) + ". "
+        
+        if neg_count > 0:
+            neg_reviews = [r for r in retrieved_reviews if r['sentiment'] == 'negative']
+            answer += f"\n\n**Negative aspects mentioned:** Critics noted "
+            # Extract negative keywords
+            neg_words = []
+            for review in neg_reviews[:2]:
+                words = review['review'].lower().split()
+                neg_words.extend([w for w in words if w in ['bad', 'terrible', 'awful', 'boring', 'waste', 'poor']])
+            if neg_words:
+                unique_words = list(set(neg_words))[:3]
+                answer += ', '.join(unique_words) + ". "
+        
+        return answer, overall, confidence
+    
+    def predict_sentiment(self, text):
+        """Classify sentiment of a single review"""
+        preprocessed = self.preprocessor.preprocess(text)
+        X = self.tfidf.transform([preprocessed])
+        prediction = self.classifier.predict(X)[0]
+        probabilities = self.classifier.predict_proba(X)[0]
+        confidence = probabilities[prediction]
+        sentiment = self.label_encoder.classes_[prediction]
+        return sentiment, confidence
+    
+    def query_rag(self, query, top_k=5):
+        """Complete RAG pipeline: retrieve + generate"""
+        retrieved = self.retrieve(query, top_k)
+        answer, sentiment, confidence = self.generate_answer(query, retrieved)
+        return answer, sentiment, confidence, retrieved
+
+# ============================================================================
+# LOAD MODELS
+# ============================================================================
+
+@st.cache_resource
+def load_rag_system():
+    """Load complete RAG system"""
     try:
-        # Load sentence transformer
-        encoder = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
+        # Load FAISS index
+        index = faiss.read_index('faiss_index.bin')
         
-        # Load FLAN-T5 for generation
-        tokenizer = AutoTokenizer.from_pretrained("google/flan-t5-small")
-        generator = AutoModelForSeq2SeqLM.from_pretrained("google/flan-t5-small")
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        generator = generator.to(device)
+        # Load review database
+        with open('review_database.pkl', 'rb') as f:
+            review_db = pickle.load(f)
         
-        # Load FAISS index - FIXED PATH
-        if not os.path.exists("models/faiss_index (1).bin"):
-            return None, None, None, None, None, None, "faiss_missing"
+        # Load classifier
+        with open('sentiment_classifier.pkl', 'rb') as f:
+            classifier_data = pickle.load(f)
         
-        index = faiss.read_index("models/faiss_index (1).bin")
+        # Load encoder
+        encoder = SentenceTransformer('all-MiniLM-L6-v2')
         
-        # Load metadata - FIXED PATH
-        if not os.path.exists("models/review_metadata (2).pkl"):
-            return None, None, None, None, None, None, "metadata_missing"
+        # Create RAG system
+        rag = RAGSystem(index, review_db, classifier_data, encoder)
         
-        with open('models/review_metadata.pkl', 'rb') as f:
-            metadata = pickle.load(f)
-        
-        # Load build report if exists
-        build_report = None
-        if os.path.exists('models/build_report.json'):
-            with open('models/build_report.json', 'r') as f:
-                build_report = json.load(f)
-        
-        return encoder, tokenizer, generator, device, index, metadata, build_report
+        return rag
     
+    except FileNotFoundError as e:
+        st.error(f"❌ Missing file: {e.filename}")
+        st.info("Required files: faiss_index.bin, review_database.pkl, sentiment_classifier.pkl")
+        st.stop()
     except Exception as e:
-        return None, None, None, None, None, None, str(e)
+        st.error(f"❌ Error loading RAG system: {e}")
+        st.stop()
 
-# ============================================================================
-# CORE RAG FUNCTIONS
-# ============================================================================
-
-def retrieve_reviews(query, encoder, index, metadata, top_k=5, filter_sentiment=None):
-    """Retrieve relevant reviews from FAISS index"""
-    
-    # Encode query
-    query_embedding = encoder.encode([query], convert_to_numpy=True)
-    
-    # Search FAISS
-    search_k = min(top_k * 3 if filter_sentiment else top_k, len(metadata['review_ids']))
-    distances, indices = index.search(query_embedding.astype('float32'), search_k)
-    
-    # Build results
-    results = []
-    for idx, distance in zip(indices[0], distances[0]):
-        if idx >= len(metadata['sentiments']):
-            continue
-            
-        sentiment = metadata['sentiments'][idx]
-        
-        # Apply sentiment filter
-        if filter_sentiment and sentiment != filter_sentiment:
-            continue
-        
-        result = {
-            'review_id': metadata['review_ids'][idx],
-            'text': metadata['texts'][idx],
-            'sentiment': sentiment,
-            'similarity_score': float(1 / (1 + distance))
-        }
-        
-        if metadata['ratings'] and idx < len(metadata['ratings']):
-            result['rating'] = metadata['ratings'][idx]
-        
-        results.append(result)
-        
-        if len(results) >= top_k:
-            break
-    
-    return results
-
-def analyze_sentiment_distribution(results):
-    """Analyze sentiment in retrieved results"""
-    if not results:
-        return {}
-    
-    sentiments = [r['sentiment'] for r in results]
-    pos_count = sentiments.count('positive')
-    neg_count = sentiments.count('negative')
-    neutral_count = sentiments.count('neutral')
-    total = len(sentiments)
-    
-    return {
-        'positive_count': pos_count,
-        'negative_count': neg_count,
-        'neutral_count': neutral_count,
-        'positive_pct': (pos_count / total * 100) if total > 0 else 0,
-        'negative_pct': (neg_count / total * 100) if total > 0 else 0,
-        'neutral_pct': (neutral_count / total * 100) if total > 0 else 0,
-        'dominant': 'positive' if pos_count > neg_count else ('negative' if neg_count > pos_count else 'neutral')
-    }
-
-def generate_explanation(query, results, tokenizer, generator, device):
-    """Generate natural language explanation with citations"""
-    
-    # Build context from top results
-    context_parts = []
-    for i, result in enumerate(results[:4], 1):
-        snippet = result['text'][:400]
-        rating = f", Rating: {result['rating']}/10" if 'rating' in result else ""
-        context_parts.append(
-            f"Review #{result['review_id']} ({result['sentiment'].upper()}{rating}):\n{snippet}"
-        )
-    
-    context = "\n\n".join(context_parts)
-    sentiment_dist = analyze_sentiment_distribution(results)
-    
-    # Create prompt
-    prompt = f"""Analyze movie reviews and answer this question: {query}
-
-Evidence from reviews:
-{context}
-
-Sentiment: {sentiment_dist['positive_count']} positive, {sentiment_dist['negative_count']} negative
-
-Provide a clear answer that:
-1. Directly answers the question
-2. References specific Review IDs (e.g., "Review #123 mentions...")
-3. Explains the sentiment reasoning
-
-Answer:"""
-
-    # Generate
-    inputs = tokenizer(prompt, return_tensors="pt", max_length=1024, truncation=True).to(device)
-    
-    with torch.no_grad():
-        outputs = generator.generate(
-            **inputs,
-            max_length=200,
-            num_beams=4,
-            temperature=0.7,
-            do_sample=False,
-            early_stopping=True
-        )
-    
-    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return answer
+# Load RAG system
+with st.spinner("🔄 Loading RAG system..."):
+    rag_system = load_rag_system()
+    st.success("✅ RAG system loaded!")
 
 # ============================================================================
 # STREAMLIT UI
 # ============================================================================
 
-def main():
-    # Header
-    st.markdown('<p class="main-header">🎬 Movie Sentiment RAG System</p>', unsafe_allow_html=True)
-    st.markdown("""
-    <div style="text-align: center; color: #666; margin-bottom: 2rem;">
-        <p>Analyze movie review sentiment with AI-powered evidence retrieval and explanations</p>
-    </div>
-    """, unsafe_allow_html=True)
+st.title("🎬 RAG Movie Review Analyzer")
+st.markdown("### Ask questions about movies and get AI-generated answers with evidence")
+
+# Tabs for different modes
+tab1, tab2 = st.tabs(["🔍 Query Mode (RAG)", "📝 Review Classification"])
+
+# ============================================================================
+# TAB 1: RAG QUERY MODE
+# ============================================================================
+
+with tab1:
+    st.subheader("🤖 Ask Questions About Movies")
+    st.markdown("*The system will search through thousands of reviews to answer your question*")
     
-    # Load resources
-    with st.spinner("🔄 Loading AI models and review database..."):
-        encoder, tokenizer, generator, device, index, metadata, error_or_report = load_all_resources()
-        
-        # Handle errors
-        if encoder is None:
-            if error_or_report == "faiss_missing":
-                st.error("""
-                ❌ **Missing FAISS Index**
-                
-                The file `models/faiss_index.bin` was not found.
-                
-                **Solution:**
-                1. Run `python build_index.py` locally
-                2. Commit `models/faiss_index.bin` to GitHub
-                3. Redeploy on Streamlit Cloud
-                
-                **Note:** Make sure you have `data/imdb_sup.csv` with your reviews before building the index.
-                """)
-            elif error_or_report == "metadata_missing":
-                st.error("""
-                ❌ **Missing Metadata**
-                
-                The file `models/review_metadata.pkl` was not found.
-                
-                **Solution:**
-                1. Run `python build_index.py` locally
-                2. Commit `models/review_metadata.pkl` to GitHub
-                3. Redeploy on Streamlit Cloud
-                """)
-            else:
-                st.error(f"""
-                ❌ **Error Loading Resources**
-                
-                {error_or_report}
-                
-                **Common causes:**
-                - Missing model files
-                - Corrupted index files
-                - Insufficient memory on Streamlit Cloud
-                
-                **Solution:** Check deployment logs and ensure all files are properly committed.
-                """)
-            st.stop()
-        
-        total_reviews = len(metadata['review_ids'])
-        build_report = error_or_report if isinstance(error_or_report, dict) else None
-    
-    # Show build info if available
-    if build_report:
-        with st.expander("ℹ️ Dataset Information", expanded=False):
-            st.markdown(f"""
-            <div class="info-box">
-                <strong>Index Build Details:</strong><br>
-                📊 Total Reviews: {build_report.get('total_reviews', 'N/A'):,}<br>
-                ✅ Positive: {build_report.get('positive_reviews', 'N/A'):,} ({build_report.get('positive_percentage', 0):.1f}%)<br>
-                ❌ Negative: {build_report.get('negative_reviews', 'N/A'):,} ({build_report.get('negative_percentage', 0):.1f}%)<br>
-                🔍 Sentiment Source: {build_report.get('sentiment_source', 'Unknown').replace('_', ' ').title()}<br>
-                💾 Index Size: {build_report.get('index_size_mb', 0):.2f} MB
-            </div>
-            """, unsafe_allow_html=True)
-    
-    # Sidebar
-    with st.sidebar:
-        st.header("⚙️ Settings")
-        
-        top_k = st.slider(
-            "Reviews to retrieve",
-            min_value=3,
-            max_value=10,
-            value=5,
-            help="Number of similar reviews to find"
-        )
-        
-        # Get available sentiments from metadata
-        unique_sentiments = set(metadata['sentiments'])
-        sentiment_options = ["All"] + sorted([s.title() for s in unique_sentiments if s])
-        
-        filter_sentiment = st.selectbox(
-            "Filter by sentiment",
-            sentiment_options
-        )
-        filter_val = None if filter_sentiment == "All" else filter_sentiment.lower()
-        
-        show_sources = st.checkbox("Show source reviews", value=True)
-        show_chart = st.checkbox("Show sentiment chart", value=True)
-        
-        st.divider()
-        st.header("📊 Database Info")
-        st.metric("Total Reviews", f"{total_reviews:,}")
-        
-        # Count sentiments
-        sentiment_counts = {}
-        for s in metadata['sentiments']:
-            sentiment_counts[s] = sentiment_counts.get(s, 0) + 1
-        
-        for sentiment, count in sorted(sentiment_counts.items()):
-            if sentiment:
-                st.metric(sentiment.title(), f"{count:,}")
-        
-        st.caption(f"Running on: {device.upper()}")
-        
-        st.divider()
-        st.header("💡 Try These")
-        examples = [
-            "Why do some movies get negative reviews?",
-            "What makes a horror movie scary?",
-            "Why do viewers love good acting?",
-            "What are common complaints about bad movies?",
-            "What makes cinematography great?",
-            "Why do some comedies fail?",
-            "What creates emotional impact in films?"
-        ]
-        
-        for ex in examples:
-            if st.button(ex, key=ex, use_container_width=True):
-                st.session_state.example_query = ex
-    
-    # Main interface
-    st.header("🔍 Ask About Movie Reviews")
-    
-    default_query = st.session_state.get('example_query', '')
-    if 'example_query' in st.session_state:
-        del st.session_state.example_query
+    # Example queries
+    with st.expander("💡 Example Queries"):
+        st.markdown("""
+        - What do people think about the acting in this movie?
+        - Are the special effects good?
+        - Is this movie worth watching?
+        - What are the main criticisms?
+        - How's the plot and storyline?
+        - What do viewers say about the cinematography?
+        """)
     
     query = st.text_input(
         "Enter your question:",
-        value=default_query,
-        placeholder="e.g., Why do some movies receive negative sentiment?",
-        label_visibility="collapsed"
+        placeholder="What do people think about the acting?",
+        key="query_input"
     )
     
-    col1, col2 = st.columns([1, 5])
-    with col1:
-        analyze_btn = st.button("🔎 Analyze", type="primary", use_container_width=True)
-    with col2:
-        if st.button("🗑️ Clear", use_container_width=True):
-            st.rerun()
+    top_k = st.slider("Number of reviews to retrieve:", 3, 10, 5)
     
-    # Process query
-    if analyze_btn and query:
-        with st.spinner("🤔 Analyzing reviews and generating explanation..."):
-            try:
-                start = datetime.now()
+    if st.button("🔍 Search & Generate Answer", type="primary"):
+        if query:
+            with st.spinner("🤖 Searching reviews and generating answer..."):
+                answer, sentiment, confidence, retrieved = rag_system.query_rag(query, top_k)
                 
-                # Retrieve
-                results = retrieve_reviews(
-                    query, encoder, index, metadata,
-                    top_k=top_k,
-                    filter_sentiment=filter_val
-                )
+                # Display generated answer
+                st.markdown("---")
+                st.subheader("💡 AI-Generated Answer")
                 
-                if not results:
-                    st.warning("⚠️ No reviews found. Try different filters or query.")
-                    st.stop()
-                
-                # Analyze sentiment
-                sent_dist = analyze_sentiment_distribution(results)
-                
-                # Generate explanation
-                answer = generate_explanation(query, results, tokenizer, generator, device)
-                
-                elapsed = (datetime.now() - start).total_seconds()
-                
-                # Display results
-                st.divider()
-                st.subheader("📝 Analysis Results")
-                
-                # Metrics
-                cols = st.columns(5)
-                cols[0].metric("Sources", len(results))
-                cols[1].metric("Positive", sent_dist['positive_count'])
-                cols[2].metric("Negative", sent_dist['negative_count'])
-                if sent_dist.get('neutral_count', 0) > 0:
-                    cols[3].metric("Neutral", sent_dist['neutral_count'])
-                cols[4].metric("Time", f"{elapsed:.1f}s")
-                
-                # Answer
-                st.subheader("💡 AI Explanation")
                 st.markdown(f"""
-                <div class="answer-box">
-                    {answer}
-                </div>
+                    <div class="answer-box">
+                        <h3>📖 Answer:</h3>
+                        <p style="font-size: 1.1rem; line-height: 1.6;">{answer}</p>
+                        <br>
+                        <p><strong>Overall Sentiment:</strong> {sentiment.upper()} 
+                        <strong>Confidence:</strong> {confidence*100:.1f}%</p>
+                    </div>
                 """, unsafe_allow_html=True)
                 
-                # Chart
-                if show_chart:
-                    st.subheader("📊 Sentiment Distribution")
-                    
-                    chart_data = []
-                    chart_colors = []
-                    chart_labels = []
-                    
-                    if sent_dist['positive_count'] > 0:
-                        chart_data.append(sent_dist['positive_count'])
-                        chart_colors.append('#28a745')
-                        chart_labels.append('Positive')
-                    
-                    if sent_dist['negative_count'] > 0:
-                        chart_data.append(sent_dist['negative_count'])
-                        chart_colors.append('#dc3545')
-                        chart_labels.append('Negative')
-                    
-                    if sent_dist.get('neutral_count', 0) > 0:
-                        chart_data.append(sent_dist['neutral_count'])
-                        chart_colors.append('#ffc107')
-                        chart_labels.append('Neutral')
-                    
-                    if chart_data:
-                        fig = go.Figure(data=[
-                            go.Bar(
-                                x=chart_labels,
-                                y=chart_data,
-                                marker_color=chart_colors,
-                                text=chart_data,
-                                textposition='auto'
-                            )
-                        ])
-                        fig.update_layout(
-                            height=300,
-                            margin=dict(l=20, r=20, t=20, b=20),
-                            showlegend=False
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-                
-                # Sources
-                if show_sources:
-                    st.subheader("📚 Source Reviews (Evidence)")
-                    for i, result in enumerate(results[:5], 1):
-                        sentiment = result['sentiment']
-                        if sentiment == 'positive':
-                            badge = "positive-badge"
-                        elif sentiment == 'negative':
-                            badge = "negative-badge"
-                        else:
-                            badge = "neutral-badge"
-                        
-                        rating_txt = f" | ⭐ {result['rating']}/10" if 'rating' in result else ""
-                        
-                        with st.expander(
-                            f"Review #{result['review_id']} - {sentiment.title()} "
-                            f"(Relevance: {result['similarity_score']:.2f}){rating_txt}",
-                            expanded=(i <= 2)
-                        ):
-                            st.markdown(f'<span class="{badge}">{sentiment.upper()}</span>', 
-                                      unsafe_allow_html=True)
-                            st.caption(f"Similarity: {result['similarity_score']:.3f}")
-                            if 'rating' in result:
-                                st.caption(f"Rating: ⭐ {result['rating']}/10")
-                            st.write("**Review Text:**")
-                            st.write(result['text'][:600] + ("..." if len(result['text']) > 600 else ""))
-                
-                # Export
-                st.divider()
-                st.subheader("💾 Export Results")
-                
-                export_data = {
-                    'query': query,
-                    'answer': answer,
-                    'sentiment_distribution': sent_dist,
-                    'processing_time_seconds': elapsed,
-                    'sources': results[:5]
-                }
-                
-                col1, col2 = st.columns(2)
-                col1.download_button(
-                    "📥 Download JSON",
-                    data=json.dumps(export_data, indent=2),
-                    file_name=f"analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                    mime="application/json",
-                    use_container_width=True
-                )
-                
-                sources_df = pd.DataFrame([
-                    {
-                        'Review_ID': r['review_id'],
-                        'Sentiment': r['sentiment'],
-                        'Relevance': r['similarity_score'],
-                        'Rating': r.get('rating', 'N/A'),
-                        'Text': r['text'][:200]
+                # Confidence gauge
+                fig = go.Figure(go.Indicator(
+                    mode = "gauge+number",
+                    value = confidence * 100,
+                    domain = {'x': [0, 1], 'y': [0, 1]},
+                    title = {'text': "Answer Confidence"},
+                    gauge = {
+                        'axis': {'range': [None, 100]},
+                        'bar': {'color': "#28a745" if sentiment == 'positive' else "#dc3545"},
+                        'steps': [
+                            {'range': [0, 50], 'color': "lightgray"},
+                            {'range': [50, 75], 'color': "gray"},
+                            {'range': [75, 100], 'color': "darkgray"}
+                        ]
                     }
-                    for r in results[:5]
-                ])
-                col2.download_button(
-                    "📥 Download CSV",
-                    data=sources_df.to_csv(index=False),
-                    file_name=f"sources_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                    mime="text/csv",
-                    use_container_width=True
-                )
+                ))
+                fig.update_layout(height=250)
+                st.plotly_chart(fig, use_container_width=True)
                 
-            except Exception as e:
-                st.error(f"❌ Error during analysis: {str(e)}")
-                with st.expander("🔍 Show error details"):
-                    st.exception(e)
+                # Display retrieved reviews (evidence)
+                st.markdown("---")
+                st.subheader("📚 Retrieved Reviews (Evidence)")
+                st.markdown(f"*Top {len(retrieved)} most relevant reviews that support this answer:*")
+                
+                for i, review_data in enumerate(retrieved, 1):
+                    sentiment_color = "🟢" if review_data['sentiment'] == 'positive' else "🔴"
+                    relevance_pct = review_data['relevance'] * 100
+                    
+                    with st.expander(f"{sentiment_color} Review {i} - {review_data['sentiment'].upper()} (Relevance: {relevance_pct:.1f}%)"):
+                        st.markdown(f"**Rating:** {review_data['rating']}")
+                        st.markdown(f"**Sentiment:** {review_data['sentiment']}")
+                        st.markdown(f"**Relevance Score:** {relevance_pct:.1f}%")
+                        st.markdown("---")
+                        st.write(review_data['review'][:500] + "..." if len(review_data['review']) > 500 else review_data['review'])
+        else:
+            st.warning("⚠️ Please enter a question")
+
+# ============================================================================
+# TAB 2: REVIEW CLASSIFICATION MODE
+# ============================================================================
+
+with tab2:
+    st.subheader("📝 Classify a Single Review")
+    st.markdown("*Enter a movie review to predict its sentiment*")
     
-    elif analyze_btn:
-        st.warning("⚠️ Please enter a question first!")
+    review_text = st.text_area(
+        "Enter movie review:",
+        height=150,
+        placeholder="This movie was absolutely amazing! The acting was superb...",
+        key="review_input"
+    )
     
-    # Footer
-    st.divider()
-    st.caption("🎬 RAG Sentiment Analysis System | Powered by Sentence Transformers & FLAN-T5")
-    st.caption("Sentiment detection: Keyword-based analysis + existing labels")
+    if st.button("🔍 Analyze Review", type="primary", key="classify_btn"):
+        if review_text and len(review_text.strip()) > 10:
+            with st.spinner("🤖 Analyzing..."):
+                sentiment, confidence = rag_system.predict_sentiment(review_text)
+                
+                st.markdown("---")
+                st.subheader("📊 Sentiment Prediction")
+                
+                if sentiment == 'positive':
+                    st.markdown(f"""
+                        <div class="positive-box">
+                            <h2 style="color: #28a745; margin: 0;">✅ POSITIVE REVIEW</h2>
+                            <p style="font-size: 1.2rem; margin: 0.5rem 0;">
+                                Confidence: <strong>{confidence*100:.1f}%</strong>
+                            </p>
+                        </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                        <div class="negative-box">
+                            <h2 style="color: #dc3545; margin: 0;">❌ NEGATIVE REVIEW</h2>
+                            <p style="font-size: 1.2rem; margin: 0.5rem 0;">
+                                Confidence: <strong>{confidence*100:.1f}%</strong>
+                            </p>
+                        </div>
+                    """, unsafe_allow_html=True)
+                
+                # Find similar reviews using RAG
+                st.markdown("---")
+                st.subheader("🔍 Similar Reviews Found")
+                
+                similar = rag_system.retrieve(review_text, top_k=3)
+                for i, sim in enumerate(similar, 1):
+                    sentiment_icon = "🟢" if sim['sentiment'] == 'positive' else "🔴"
+                    with st.expander(f"{sentiment_icon} Similar Review {i} - {sim['sentiment'].upper()}"):
+                        st.write(sim['review'][:300] + "..." if len(sim['review']) > 300 else sim['review'])
+        else:
+            st.warning("⚠️ Please enter a review (at least 10 characters)")
 
-if __name__ == "__main__":
-    main()
+# ============================================================================
+# SIDEBAR
+# ============================================================================
 
+with st.sidebar:
+    st.header("ℹ️ About RAG System")
+    
+    st.markdown("""
+    ### 🎯 What is RAG?
+    
+    **RAG (Retrieval-Augmented Generation)** combines:
+    
+    1. **Retriever:** Searches database for relevant reviews
+    2. **Generator:** Creates natural language answers
+    
+    ### 🔧 How It Works:
+    
+    1. You ask a question
+    2. System searches thousands of reviews
+    3. Retrieves most relevant reviews
+    4. Generates answer based on evidence
+    5. Shows you the source reviews
+    
+    ### 📊 Technology:
+    
+    - **Encoder:** Sentence-BERT
+    - **Vector DB:** FAISS
+    - **Classifier:** Logistic Regression
+    - **Reviews:** {len(rag_system.reviews):,}
+    """)
+    
+    st.markdown("---")
+    st.markdown("### 📈 Stats")
+    st.metric("Total Reviews", f"{len(rag_system.reviews):,}")
+    
+    pos_count = sum(1 for s in rag_system.sentiments if s == 'positive')
+    neg_count = len(rag_system.sentiments) - pos_count
+    st.metric("Positive Reviews", f"{pos_count:,}")
+    st.metric("Negative Reviews", f"{neg_count:,}")
 
+# Footer
+st.markdown("---")
+st.markdown("""
+    <div style="text-align: center; color: #6c757d; padding: 1rem 0;">
+        <p><strong>🎬 RAG-Powered Movie Review Analysis System</strong></p>
+        <p>Retrieval-Augmented Generation | Sentence-BERT | FAISS | ML Classification</p>
+    </div>
+""", unsafe_allow_html=True)
