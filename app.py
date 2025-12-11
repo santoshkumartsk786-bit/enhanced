@@ -386,7 +386,6 @@ query = st.text_input(
 # Clear the example_query after it's been used
 if default_query:
     st.session_state.example_query = ''
-    )
     
     col1, col2 = st.columns([1, 5])
     with col1:
@@ -563,3 +562,4 @@ if default_query:
 if __name__ == "__main__":
 
     main()
+
